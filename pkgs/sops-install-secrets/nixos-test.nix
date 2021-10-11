@@ -1,8 +1,8 @@
-{ makeTest ? import <nixpkgs/nixos/tests/make-test-python.nix>, pkgs ? import <nixpkgs> }:
+{ makeTest ? import <nixpkgs/nixos/tests/make-test-python.nix>, pkgs ? import <nixpkgs> {} }:
 {
  ssh-keys = makeTest {
    name = "sops-ssh-keys";
-   nodes.server = { ... }: {
+   machine = {
      imports = [ ../../modules/sops ];
      services.openssh.enable = true;
      services.openssh.hostKeys = [{
@@ -15,8 +15,7 @@
    };
 
    testScript = ''
-     start_all()
-     server.succeed("cat /run/secrets/test_key | grep -q test_value")
+     machine.succeed("cat /run/secrets/test_key | grep -q test_value")
    '';
  } {
    inherit pkgs;
@@ -35,7 +34,6 @@
    };
 
    testScript = ''
-     start_all()
      machine.succeed("cat /run/secrets/test_key | grep -q test_value")
    '';
   } {
@@ -64,7 +62,6 @@
   };
 
   testScript = ''
-    start_all()
     machine.succeed("cat /run/secrets/test_key | grep -q test_value")
   '';
   } {
@@ -74,7 +71,7 @@
 
  pgp-keys = makeTest {
    name = "sops-pgp-keys";
-   nodes.server = { pkgs, lib, config, ... }: {
+   machine = { pkgs, lib, config, ... }: {
      imports = [
        ../../modules/sops
      ];
@@ -113,18 +110,52 @@
             raise Exception(f"'{exp}' != '{act}'")
 
 
-    start_all()
-
-    value = server.succeed("cat /run/secrets/test_key")
+    value = machine.succeed("cat /run/secrets/test_key")
     assertEqual("test_value", value)
 
-    server.succeed("runuser -u someuser -- cat /run/secrets/test_key >&2")
-    value = server.succeed("cat /run/secrets/nested/test/file")
+    machine.succeed("runuser -u someuser -- cat /run/secrets/test_key >&2")
+    value = machine.succeed("cat /run/secrets/nested/test/file")
     assertEqual(value, "another value")
 
-    target = server.succeed("readlink -f /run/existing-file")
+    target = machine.succeed("readlink -f /run/existing-file")
     assertEqual("/run/secrets.d/1/existing-file", target.strip())
   '';
+ } {
+   inherit pkgs;
+   inherit (pkgs) system;
+ };
+
+ ssh-keys-early-secrets = makeTest {
+   name = "sops-ssh-keys-early-secrets";
+   machine = { pkgs, lib, config, ... }: {
+     imports = [ ../../modules/sops ];
+
+     users.users.someuser = {
+       isNormalUser = true;
+       passwordFile = config.sops.earlySecrets.someuser-password.path;
+     };
+
+     services.openssh.enable = true;
+     services.openssh.hostKeys = [{
+       type = "rsa";
+       bits = 4096;
+       path = ./test-assets/ssh-key;
+     }];
+
+     sops.defaultSopsFile = ./test-assets/secrets.yaml;
+     sops.earlySecrets.someuser-password = {};
+   };
+
+   testScript = ''
+     machine.wait_for_unit("multi-user.target")
+     machine.wait_for_unit("getty@tty1.service")
+     machine.wait_until_tty_matches(1, "login: ")
+     machine.send_chars("someuser\n")
+     machine.wait_until_tty_matches(1, "Password: ")
+     machine.send_chars("somepassword\n")
+     machine.send_chars("touch login-ok\n")
+     machine.wait_for_file("/home/someuser/login-ok")
+   '';
  } {
    inherit pkgs;
    inherit (pkgs) system;

@@ -23,7 +23,7 @@ let
         default = config._module.args.name;
         description = ''
           Key used to lookup in the sops file.
-          No tested data structures are supported right now.
+          No nested data structures are supported right now.
           This option is ignored if format is binary.
         '';
       };
@@ -80,25 +80,28 @@ let
       };
     };
   });
-  manifest = pkgs.writeText "manifest.json" (builtins.toJSON {
-    secrets = builtins.attrValues cfg.secrets;
+
+  manifest = (secrets: early: pkgs.writeText "manifest.json" (builtins.toJSON {
+    secrets = builtins.attrValues secrets;
     # Does this need to be configurable?
     secretsMountPoint = "/run/secrets.d";
     symlinkPath = "/run/secrets";
+    keysGroup = if early then "root" else "keys";
     gnupgHome = cfg.gnupg.home;
     sshKeyPaths = cfg.gnupg.sshKeyPaths;
     ageKeyFile = cfg.age.keyFile;
     ageSshKeyPaths = cfg.age.sshKeyPaths;
-  });
+  }));
 
-  checkedManifest = let
+  checkedManifest = (secrets: early: let
+    secretsManifest = manifest secrets early;
     sops-install-secrets = (pkgs.buildPackages.callPackage ../.. {}).sops-install-secrets;
   in pkgs.runCommand "checked-manifest.json" {
     nativeBuildInputs = [ sops-install-secrets ];
   } ''
-    sops-install-secrets -check-mode=${if cfg.validateSopsFiles then "sopsfile" else "manifest"} ${manifest}
-    cp ${manifest} $out
-  '';
+    sops-install-secrets -check-mode=${if cfg.validateSopsFiles then "sopsfile" else "manifest"} ${secretsManifest}
+    cp ${secretsManifest} $out
+  '');
 in {
   options.sops = {
     secrets = mkOption {
@@ -106,6 +109,14 @@ in {
       default = {};
       description = ''
         Path where the latest secrets are mounted to.
+      '';
+    };
+
+    earlySecrets = mkOption {
+      type = types.attrsOf secretType;
+      default = {};
+      description = ''
+        Path where the latest early secrets are mounted to.
       '';
     };
 
@@ -188,31 +199,42 @@ in {
     (mkRenamedOptionModule [ "sops" "gnupgHome" ] [ "sops" "gnupg" "home" ])
     (mkRenamedOptionModule [ "sops" "sshKeyPaths" ] [ "sops" "gnupg" "sshKeyPaths" ])
   ];
-  config = mkIf (cfg.secrets != {}) {
+  config = mkIf (cfg.secrets != {} || cfg.earlySecrets != {}) {
     assertions = [{
       assertion = cfg.gnupg.home != null || cfg.gnupg.sshKeyPaths != [] || cfg.age.keyFile != null || cfg.age.sshKeyPaths != [];
       message = "No key source configurated for sops";
     } {
       assertion = !(cfg.gnupg.home != null && cfg.gnupg.sshKeyPaths != []);
       message = "Exactly one of sops.gnupg.home and sops.gnupg.sshKeyPaths must be set";
+    } {
+      assertion = lib.all (secret: secret.owner == "root") (builtins.attrValues cfg.earlySecrets);
+      message = "Early secrets can only be owned by root";
     }] ++ optionals cfg.validateSopsFiles (
-      concatLists (mapAttrsToList (name: secret: [{
+      concatLists (forEach [ "secrets" "earlySecrets" ] (secrets: concatLists (mapAttrsToList (name: secret: [{
         assertion = builtins.pathExists secret.sopsFile;
-        message = "Cannot find path '${secret.sopsFile}' set in sops.secrets.${strings.escapeNixIdentifier name}.sopsFile";
+        message = "Cannot find path '${secret.sopsFile}' set in sops.${secrets}.${strings.escapeNixIdentifier name}.sopsFile";
       } {
         assertion =
           builtins.isPath secret.sopsFile ||
           (builtins.isString secret.sopsFile && hasPrefix builtins.storeDir secret.sopsFile);
         message = "'${secret.sopsFile}' is not in the Nix store. Either add it to the Nix store or set sops.validateSopsFiles to false";
-      }]) cfg.secrets)
+      }]) cfg.${secrets})))
     );
+
+    system.activationScripts.setup-early-secrets = let
+      sops-install-secrets = (pkgs.callPackage ../.. {}).sops-install-secrets;
+    in mkIf (cfg.earlySecrets != {}) (stringAfter ([ "specialfs" ] ++ optional cfg.age.generateKey "generate-age-key") ''
+      echo setting up early secrets...
+      ${optionalString (cfg.gnupg.home != null) "SOPS_GPG_EXEC=${pkgs.gnupg}/bin/gpg"} ${sops-install-secrets}/bin/sops-install-secrets ${checkedManifest cfg.earlySecrets true}
+    '');
+    system.activationScripts.users.deps = mkIf (cfg.earlySecrets != {}) [ "setup-early-secrets" ];
 
     system.activationScripts.setup-secrets = let
       sops-install-secrets = (pkgs.callPackage ../.. {}).sops-install-secrets;
-    in stringAfter ([ "specialfs" "users" "groups" ] ++ optional cfg.age.generateKey "generate-age-key") ''
+    in mkIf (cfg.secrets != {}) (stringAfter ([ "specialfs" "users" "groups" ] ++ optional cfg.age.generateKey "generate-age-key") ''
       echo setting up secrets...
-      ${optionalString (cfg.gnupg.home != null) "SOPS_GPG_EXEC=${pkgs.gnupg}/bin/gpg"} ${sops-install-secrets}/bin/sops-install-secrets ${checkedManifest}
-    '';
+      ${optionalString (cfg.gnupg.home != null) "SOPS_GPG_EXEC=${pkgs.gnupg}/bin/gpg"} ${sops-install-secrets}/bin/sops-install-secrets ${checkedManifest cfg.secrets false}
+    '');
 
     system.activationScripts.generate-age-key = (mkIf cfg.age.generateKey) (stringAfter [] ''
       if [[ ! -f '${cfg.age.keyFile}' ]]; then

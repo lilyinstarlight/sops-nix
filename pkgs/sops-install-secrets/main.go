@@ -46,6 +46,7 @@ type manifest struct {
 	Secrets           []secret `json:"secrets"`
 	SecretsMountPoint string   `json:"secretsMountpoint"`
 	SymlinkPath       string   `json:"symlinkPath"`
+	KeysGroup         string   `json:"keysGroup"`
 	SSHKeyPaths       []string `json:"sshKeyPaths"`
 	GnupgHome         string   `json:"gnupgHome"`
 	AgeKeyFile        string   `json:"ageKeyFile"`
@@ -377,14 +378,34 @@ func writeSecrets(secretDir string, secrets []secret, keysGid int) error {
 	return nil
 }
 
-func lookupKeysGroup() (int, error) {
-	group, err := user.LookupGroup("keys")
+func lookupUser(username string) (int, error) {
+	if username == "root" {
+		return 0, nil
+	}
+
+	userInfo, err := user.Lookup(username)
 	if err != nil {
-		return 0, fmt.Errorf("Failed to lookup 'keys' group: %w", err)
+		return 0, fmt.Errorf("Failed to lookup user '%s': %w", username, err)
+	}
+	uid, err := strconv.ParseUint(userInfo.Uid, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("Cannot parse uid %s: %w", userInfo.Uid, err)
+	}
+	return int(uid), nil
+}
+
+func lookupGroup(groupname string) (int, error) {
+	if groupname == "root" {
+		return 0, nil
+	}
+
+	group, err := user.LookupGroup(groupname)
+	if err != nil {
+		return 0, fmt.Errorf("Failed to lookup group '%s': %w", groupname, err)
 	}
 	gid, err := strconv.ParseInt(group.Gid, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("Cannot parse keys gid %s: %w", group.Gid, err)
+		return 0, fmt.Errorf("Cannot parse gid %s: %w", group.Gid, err)
 	}
 	return int(gid), nil
 }
@@ -447,25 +468,17 @@ func (app *appContext) validateSecret(secret *secret) error {
 
 	if app.checkMode == Off {
 		// we only access to the user/group during deployment
-		owner, err := user.Lookup(secret.Owner)
+		ownerUid, err := lookupUser(secret.Owner)
 		if err != nil {
-			return fmt.Errorf("Failed to lookup user '%s': %w", secret.Owner, err)
+			return err
 		}
-		ownerNr, err := strconv.ParseUint(owner.Uid, 10, 64)
-		if err != nil {
-			return fmt.Errorf("Cannot parse uid %s: %w", owner.Uid, err)
-		}
-		secret.owner = int(ownerNr)
+		secret.owner = ownerUid
 
-		group, err := user.LookupGroup(secret.Group)
+		groupId, err := lookupGroup(secret.Group)
 		if err != nil {
-			return fmt.Errorf("Failed to lookup group '%s': %w", secret.Group, err)
+			return err
 		}
-		groupNr, err := strconv.ParseUint(group.Gid, 10, 64)
-		if err != nil {
-			return fmt.Errorf("Cannot parse gid %s: %w", group.Gid, err)
-		}
-		secret.group = int(groupNr)
+		secret.group = groupId
 	}
 
 	if secret.Format == "" {
@@ -496,6 +509,9 @@ func (app *appContext) validateManifest() error {
 	}
 	if m.SymlinkPath == "" {
 		m.SymlinkPath = "/run/secrets"
+	}
+	if m.KeysGroup == "" {
+		m.KeysGroup = "keys"
 	}
 	if m.GnupgHome != "" {
 		errorFmt := "gnupgHome and %s were specified in the manifest. " +
@@ -676,7 +692,7 @@ func installSecrets(args []string) error {
 		return nil
 	}
 
-	keysGid, err := lookupKeysGroup()
+	keysGid, err := lookupGroup(app.manifest.KeysGroup)
 	if err != nil {
 		return err
 	}
